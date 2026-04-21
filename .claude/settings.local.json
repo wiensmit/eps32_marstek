@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sS https://raw.githubusercontent.com/wiensmit/grott_server_addon/main/repository.yaml)",
+      "Bash(curl -sS https://api.github.com/repos/wiensmit/grott_server_addon/contents/grott-complete)",
+      "Bash(python3 -c \"import json,sys; [print\\(f\\\\\"{x['type']:4} {x['name']}\\\\\"\\) for x in json.load\\(sys.stdin\\)]\")"
     ]
   }
 }

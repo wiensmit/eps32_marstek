@@ -1,21 +1,19 @@
-name: P1 REST API
+name: "P1 REST API"
 version: "1.0.0"
 slug: p1_rest_api
-description: REST API exposing a Home Assistant P1 power sensor as JSON for ESP32 polling.
+description: "REST API exposing a Home Assistant P1 power sensor as JSON for ESP32 polling"
+url: https://github.com/wiensmit/eps32_marstek
 arch:
-  - amd64
   - aarch64
-  - armv7
-  - armhf
-  - i386
+  - amd64
 startup: application
 boot: auto
 init: false
 homeassistant_api: true
 ports:
-  "8088/tcp": 8088
+  8088/tcp: 8088
 ports_description:
-  "8088/tcp": P1 REST endpoint
+  8088/tcp: "P1 REST endpoint"
 options:
   sensor_entity: sensor.marstek_meter_p1_adjusted
   listen_port: 8088
