@@ -61,31 +61,14 @@ def fetch_power() -> tuple[float, bool]:
 
 
 def shelly_payload(value: float) -> dict:
+    # Minimal shape — only the fields esp_marstek.ino pollMeter() reads.
+    # The full Shelly schema overflows the ESP32's 512B JSON buffer.
     return {
         "id": 0,
-        "a_current": 0.0,
-        "a_voltage": 230.0,
-        "a_act_power": value,
-        "a_aprt_power": abs(value),
-        "a_pf": 1.0 if value >= 0 else -1.0,
-        "a_freq": 50.0,
-        "b_current": 0.0,
-        "b_voltage": 230.0,
-        "b_act_power": 0.0,
-        "b_aprt_power": 0.0,
-        "b_pf": 1.0,
-        "b_freq": 50.0,
-        "c_current": 0.0,
-        "c_voltage": 230.0,
-        "c_act_power": 0.0,
-        "c_aprt_power": 0.0,
-        "c_pf": 1.0,
-        "c_freq": 50.0,
-        "n_current": None,
-        "total_current": 0.0,
         "total_act_power": value,
-        "total_aprt_power": abs(value),
-        "user_calibrated_phase": [],
+        "a_act_power": value,
+        "b_act_power": 0.0,
+        "c_act_power": 0.0,
     }
 
 

@@ -1,5 +1,5 @@
 name: "P1 REST API"
-version: "1.0.1"
+version: "1.0.2"
 slug: p1_rest_api
 description: "REST API exposing a Home Assistant P1 power sensor as JSON for ESP32 polling"
 url: https://github.com/wiensmit/eps32_marstek

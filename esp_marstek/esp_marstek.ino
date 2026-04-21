@@ -89,6 +89,45 @@ const unsigned long METER_HTTP_TIMEOUT  = 2000;
 #define RS485_ENABLE_MAGIC   21930  // 0x55AA
 
 // ============================================================================
+// Type definitions — kept above functions so Arduino auto-prototypes see them
+// ============================================================================
+struct WriteEntry {
+  uint16_t addr;
+  uint16_t value;
+};
+
+enum PollState {
+  // Startup sequence
+  STATE_STARTUP_RS485,       STATE_STARTUP_WAIT_RS485,
+  STATE_STARTUP_WORKMODE,    STATE_STARTUP_WAIT_WORKMODE,
+  STATE_STARTUP_MAXCHARGE,   STATE_STARTUP_WAIT_MAXCHARGE,
+  STATE_STARTUP_MAXDISCHARGE,STATE_STARTUP_WAIT_MAXDISCHARGE,
+
+  // Fast cycle
+  STATE_IDLE,
+  STATE_SEND_BATT,           STATE_WAIT_BATT,
+  STATE_SEND_AC,             STATE_WAIT_AC,
+
+  // Slow cycle extras
+  STATE_SEND_TEMPS,          STATE_WAIT_TEMPS,
+  STATE_SEND_CTRL_RS485,     STATE_WAIT_CTRL_RS485,
+  STATE_SEND_CTRL_FORCE,     STATE_WAIT_CTRL_FORCE,
+  STATE_SEND_CTRL_POWER,     STATE_WAIT_CTRL_POWER,
+  STATE_SEND_CTRL_WORKMODE,  STATE_WAIT_CTRL_WORKMODE,
+  STATE_SEND_CTRL_MAXPOWER,  STATE_WAIT_CTRL_MAXPOWER,
+
+  // Schedule read (on-demand)
+  STATE_SEND_SCHEDULES,      STATE_WAIT_SCHEDULES,
+
+  // Write processing
+  STATE_PROCESS_WRITES,
+  STATE_WAIT_WRITE,
+
+  // Done
+  STATE_CYCLE_COMPLETE
+};
+
+// ============================================================================
 // Globals
 // ============================================================================
 ModbusRTU mb;
@@ -192,11 +231,6 @@ void recordError(uint8_t code) {
 // ============================================================================
 // Write queue — ring buffer with dedup
 // ============================================================================
-struct WriteEntry {
-  uint16_t addr;
-  uint16_t value;
-};
-
 #define WRITE_QUEUE_SIZE 16
 static WriteEntry writeQueue[WRITE_QUEUE_SIZE];
 static uint8_t    wqHead = 0;
@@ -420,37 +454,6 @@ void checkSettingsWatchdog() {
 // ============================================================================
 // State machine
 // ============================================================================
-enum PollState {
-  // Startup sequence
-  STATE_STARTUP_RS485,       STATE_STARTUP_WAIT_RS485,
-  STATE_STARTUP_WORKMODE,    STATE_STARTUP_WAIT_WORKMODE,
-  STATE_STARTUP_MAXCHARGE,   STATE_STARTUP_WAIT_MAXCHARGE,
-  STATE_STARTUP_MAXDISCHARGE,STATE_STARTUP_WAIT_MAXDISCHARGE,
-
-  // Fast cycle
-  STATE_IDLE,
-  STATE_SEND_BATT,           STATE_WAIT_BATT,
-  STATE_SEND_AC,             STATE_WAIT_AC,
-
-  // Slow cycle extras
-  STATE_SEND_TEMPS,          STATE_WAIT_TEMPS,
-  STATE_SEND_CTRL_RS485,     STATE_WAIT_CTRL_RS485,
-  STATE_SEND_CTRL_FORCE,     STATE_WAIT_CTRL_FORCE,
-  STATE_SEND_CTRL_POWER,     STATE_WAIT_CTRL_POWER,
-  STATE_SEND_CTRL_WORKMODE,  STATE_WAIT_CTRL_WORKMODE,
-  STATE_SEND_CTRL_MAXPOWER,  STATE_WAIT_CTRL_MAXPOWER,
-
-  // Schedule read (on-demand)
-  STATE_SEND_SCHEDULES,      STATE_WAIT_SCHEDULES,
-
-  // Write processing
-  STATE_PROCESS_WRITES,
-  STATE_WAIT_WRITE,
-
-  // Done
-  STATE_CYCLE_COMPLETE
-};
-
 static PollState     pollState           = STATE_STARTUP_RS485;
 static unsigned long lastFastCycleStart  = 0;
 static unsigned long lastSlowCycleStart  = 0;
