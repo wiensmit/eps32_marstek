@@ -9,7 +9,9 @@
       "Bash(curl -sS --max-time 3 http://192.168.2.102/)",
       "Bash(curl -sS --max-time 3 http://192.168.2.102/health)",
       "Bash(curl -sS --max-time 3 http://192.168.2.102/meter)",
-      "Bash(curl -sS --max-time 3 http://192.168.2.102/auto)"
+      "Bash(curl -sS --max-time 3 http://192.168.2.102/auto)",
+      "Bash(curl -sS --max-time 3 http://192.168.2.102/status)",
+      "Bash(curl -sS --max-time 3 http://192.168.2.102/summary)"
     ]
   }
 }
