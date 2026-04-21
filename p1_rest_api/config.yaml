@@ -1,7 +1,7 @@
-name: Shelly P1 Proxy
+name: P1 REST API
 version: "1.0.0"
-slug: shelly_p1_proxy
-description: Serves a Home Assistant power sensor as a Shelly Pro 3EM compatible HTTP endpoint for ESP32 polling.
+slug: p1_rest_api
+description: REST API exposing a Home Assistant P1 power sensor as JSON for ESP32 polling.
 arch:
   - amd64
   - aarch64
@@ -15,7 +15,7 @@ homeassistant_api: true
 ports:
   "8088/tcp": 8088
 ports_description:
-  "8088/tcp": Shelly-compatible HTTP endpoint
+  "8088/tcp": P1 REST endpoint
 options:
   sensor_entity: sensor.marstek_meter_p1_adjusted
   listen_port: 8088
