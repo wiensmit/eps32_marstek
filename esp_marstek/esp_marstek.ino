@@ -72,6 +72,8 @@ const unsigned long METER_STALE_MS      = 10000;
 #define REG_CHARGE_POWER     42020
 #define REG_DISCHARGE_POWER  42021
 #define REG_WORK_MODE        43000
+#define REG_CHARGE_CUTOFF    44000  // Hard BMS cap; scale ÷10 (1000 = 100%)
+#define REG_DISCHARGE_CUTOFF 44001  // Hard BMS floor; scale ÷10 (100 = 10%)
 #define REG_MAX_CHARGE       44002
 #define REG_MAX_DISCHARGE    44003
 
@@ -186,7 +188,7 @@ uint16_t regBuf[30];
 // --- Cache: monitoring ---
 static uint16_t cache_batt_voltage = 0;
 static int16_t  cache_batt_current = 0;
-static int16_t  cache_batt_power   = 0;
+static int32_t  cache_batt_power   = 0;  // 32102-32103 combined; scale 1 W (signed)
 static uint16_t cache_batt_soc     = 0;
 static int16_t  cache_batt_temp1   = 0;
 
@@ -206,6 +208,8 @@ static uint16_t cache_discharge_power = 0;
 static uint16_t cache_work_mode       = 0;
 static uint16_t cache_max_charge      = 0;
 static uint16_t cache_max_discharge   = 0;
+static uint16_t cache_charge_cutoff    = 0;  // Hard BMS cap,   scale ÷10 (1000 = 100%)
+static uint16_t cache_discharge_cutoff = 0;  // Hard BMS floor, scale ÷10 (120 = 12%)
 
 // Raw uint32 from 2-register modbus reads; consumer multiplies × 0.01 to get kWh
 static uint32_t cache_total_charge_energy    = 0;
@@ -376,17 +380,42 @@ bool modeFromString(const char* s, BatteryMode &out) {
 }
 
 // ============================================================================
-// Self-consumption (EMA + hysteresis)
+// Self-consumption — integral controller on grid power
 // ============================================================================
+// Classic zero-export control: treat grid power as the process variable with
+// setpoint 0 (house neither imports nor exports), and the battery AC setpoint
+// as the manipulated variable. Each cycle, adjust the battery setpoint by a
+// fraction of the current grid reading:
+//
+//   setpoint -= Ki * (grid - target_grid)
+//
+// Positive setpoint = charge, negative = discharge. Integrator has no feed-
+// forward term, so command-lag in the battery's physical response never causes
+// overshoot: the grid meter closes the loop through physical reality. Ki < 1
+// guarantees convergence without oscillation. SC_KI = 0.5 converges in ~5
+// cycles (~5 s at fast_cycle_ms = 1000), well within the noise floor.
+// Battery physical response has a transport delay of ~3-5 s (Modbus write
+// propagation + inverter ramp). If the control loop's time constant (1/Ki)
+// is comparable or shorter, the integrator winds up while the battery is
+// still responding to the previous command — classic oscillation. We choose
+// Ki so the loop time constant is well ABOVE the ramp time, and slew-limit
+// the setpoint so no single cycle can command more than the battery can
+// physically follow.
+static const float SC_KI             = 0.1f;    // τ_loop = 10 s >> τ_battery ~3-5 s
+static const float SC_TARGET_GRID    = 0.0f;    // 0 W = net zero; negative for an export bias
+static const float SC_MODE_HYST_W    = 1000.0f; // once in a direction, setpoint must cross this to flip
+static const float SC_MAX_SLEW_W     = 200.0f;  // max setpoint change per second — keeps the commanded
+                                                // power change slower than the physical ramp rate
+
+static float   sc_setpoint       = 0.0f;   // signed battery setpoint (W)
 static float   sc_smoothed_grid_w = 0.0f;
 static bool    sc_smoothed_init   = false;
-static uint8_t sc_last_action     = 0;  // 0=idle, 1=charge, 2=discharge
-static float   sc_last_power      = 0.0f;
+static uint8_t sc_mode            = 0;     // 0 = idle, 1 = charge, 2 = discharge
 
 void resetSelfConsumption() {
   sc_smoothed_init = false;
-  sc_last_action   = 0;
-  sc_last_power    = 0.0f;
+  sc_setpoint      = 0.0f;
+  sc_mode          = 0;
 }
 
 void computeSelfConsumption(uint16_t &fmode, uint16_t &cpow, uint16_t &dpow) {
@@ -394,12 +423,12 @@ void computeSelfConsumption(uint16_t &fmode, uint16_t &cpow, uint16_t &dpow) {
 
   // Safety: stale / missing meter → idle
   if (!meter_valid || (millis() - meter_last_update) > METER_STALE_MS) {
-    sc_last_action = 0;
-    sc_last_power  = 0.0f;
+    sc_setpoint = 0.0f;
+    sc_mode     = 0;
     return;
   }
 
-  // EMA smoothing
+  // EMA smoothing of the grid meter reading (reduces jitter from the P1 meter).
   if (!sc_smoothed_init) {
     sc_smoothed_grid_w = meter_total_power;
     sc_smoothed_init   = true;
@@ -408,31 +437,52 @@ void computeSelfConsumption(uint16_t &fmode, uint16_t &cpow, uint16_t &dpow) {
                        + (1.0f - config.sc_smoothing) * sc_smoothed_grid_w;
   }
 
-  uint8_t action = 0;
-  float   power  = 0.0f;
+  // Integrator update. grid > 0 = importing → reduce setpoint (discharge more
+  // or charge less). grid < 0 = exporting → increase setpoint (charge more).
+  // Slew-limited so rapid cyclic loads (induction hob burst-firing) don't
+  // drag the setpoint between extremes every cycle.
+  float error = sc_smoothed_grid_w - SC_TARGET_GRID;
+  float delta = -SC_KI * error;
+  if (delta >  SC_MAX_SLEW_W) delta =  SC_MAX_SLEW_W;
+  if (delta < -SC_MAX_SLEW_W) delta = -SC_MAX_SLEW_W;
+  sc_setpoint += delta;
 
-  if (sc_smoothed_grid_w > config.sc_offset_w && cache_batt_soc > config.sc_min_soc) {
-    action = 2;
-    power  = min(sc_smoothed_grid_w, (float)config.max_discharge_w);
-  } else if (sc_smoothed_grid_w < -config.sc_offset_w && cache_batt_soc < config.sc_max_soc) {
-    action = 1;
-    power  = min(fabsf(sc_smoothed_grid_w), (float)config.max_charge_w);
+  // SoC guards.
+  if (cache_batt_soc >= config.sc_max_soc && sc_setpoint > 0.0f) sc_setpoint = 0.0f;
+  if (cache_batt_soc <= config.sc_min_soc && sc_setpoint < 0.0f) sc_setpoint = 0.0f;
+
+  // Power limits (prevent integrator windup).
+  if (sc_setpoint >  (float)config.max_charge_w)     sc_setpoint =  (float)config.max_charge_w;
+  if (sc_setpoint < -(float)config.max_discharge_w)  sc_setpoint = -(float)config.max_discharge_w;
+
+  // Mode-switch hysteresis. Once committed to a direction, require the setpoint
+  // to cross zero by SC_MODE_HYST_W before flipping. Stops rapid charge↔discharge
+  // cycling when the grid reading straddles 0. From idle, the normal deadband
+  // (sc_offset_w) governs entry into a mode.
+  uint8_t new_mode = sc_mode;
+  if (sc_mode == 0) {
+    if      (sc_setpoint >  config.sc_offset_w) new_mode = 1;
+    else if (sc_setpoint < -config.sc_offset_w) new_mode = 2;
+  } else if (sc_mode == 1) {
+    if (sc_setpoint < -SC_MODE_HYST_W) new_mode = 2;
+    else if (sc_setpoint < config.sc_offset_w) new_mode = 0;
+  } else if (sc_mode == 2) {
+    if (sc_setpoint >  SC_MODE_HYST_W) new_mode = 1;
+    else if (sc_setpoint > -config.sc_offset_w) new_mode = 0;
   }
+  sc_mode = new_mode;
 
-  // Hysteresis
-  bool accept = (action != sc_last_action)
-             || (fabsf(power - sc_last_power) > config.sc_deadband_w);
+  // Idle: don't command anything, but let the integrator keep winding so it can
+  // cross the deadband when the grid moves sustainedly.
+  if (sc_mode == 0) return;
 
-  if (!accept) {
-    action = sc_last_action;
-    power  = sc_last_power;
-  } else {
-    sc_last_action = action;
-    sc_last_power  = power;
-  }
+  // Clamp setpoint to the active direction so we never send a "charge at
+  // negative watts" or vice versa.
+  if (sc_mode == 1 && sc_setpoint < 0.0f) sc_setpoint = 0.0f;
+  if (sc_mode == 2 && sc_setpoint > 0.0f) sc_setpoint = 0.0f;
 
-  if      (action == 1) { fmode = 1; cpow = (uint16_t)power; }
-  else if (action == 2) { fmode = 2; dpow = (uint16_t)power; }
+  if (sc_mode == 1) { fmode = 1; cpow = (uint16_t)sc_setpoint; }
+  else              { fmode = 2; dpow = (uint16_t)(-sc_setpoint); }
 }
 
 // ============================================================================
@@ -465,11 +515,25 @@ void computeDesired(uint16_t &fmode, uint16_t &cpow, uint16_t &dpow) {
 }
 
 void enforceDesiredState() {
-  // Static policy — always these values
+  // Static-policy registers. Cache is initialized to 0 and only updated when
+  // the queue writes them, so after startup the guards here fire ONCE to
+  // bring cache in line. That post-startup write seems to be what primes the
+  // Marstek to accept force_mode commands — the startup-sequence writes
+  // (via trySendWriteHreg) don't have the same effect for reasons unclear.
+  // After the one-shot, cache matches and no further writes happen, so we
+  // don't risk disturbing an active charge.
   if (cache_rs485_enable != RS485_ENABLE_MAGIC) queueWrite(REG_RS485_ENABLE, RS485_ENABLE_MAGIC);
   if (cache_work_mode != 0)                     queueWrite(REG_WORK_MODE, 0);
   if (cache_max_charge != config.max_charge_w)  queueWrite(REG_MAX_CHARGE, config.max_charge_w);
   if (cache_max_discharge != config.max_discharge_w) queueWrite(REG_MAX_DISCHARGE, config.max_discharge_w);
+  // BMS SoC caps. target_soc (42011) is the soft cap used by Marstek's auto
+  // mode; charge_cutoff (44000) and discharge_cutoff (44001) are the hard
+  // BMS limits (scale ÷10) that supersede force_mode. Cache starts at 0 so
+  // these fire exactly once post-startup, same pattern as the other static
+  // writes. 1000 = 100% upper, 120 = 12% lower.
+  if (cache_target_soc != 100)                    queueWrite(REG_TARGET_SOC, 100);
+  if (cache_charge_cutoff != 1000)                queueWrite(REG_CHARGE_CUTOFF, 1000);
+  if (cache_discharge_cutoff != 120)              queueWrite(REG_DISCHARGE_CUTOFF, 120);
 
   // Mode-derived
   uint16_t fmode, cpow, dpow;
@@ -479,9 +543,13 @@ void enforceDesiredState() {
   last_desired_cpow  = cpow;
   last_desired_dpow  = dpow;
 
-  if (cache_force_mode      != fmode) queueWrite(REG_FORCE_MODE, fmode);
-  if (cache_charge_power    != cpow)  queueWrite(REG_CHARGE_POWER, cpow);
-  if (cache_discharge_power != dpow)  queueWrite(REG_DISCHARGE_POWER, dpow);
+  // Marstek's internal charge/discharge action times out ~60s after the last
+  // register write even though the register keeps its value — so write every
+  // cycle unconditionally. Combined with fast_cycle_ms = 1000, this refreshes
+  // at 1 Hz and charging stays active indefinitely.
+  queueWrite(REG_FORCE_MODE,      fmode);
+  queueWrite(REG_CHARGE_POWER,    cpow);
+  queueWrite(REG_DISCHARGE_POWER, dpow);
 }
 
 // ============================================================================
@@ -491,14 +559,14 @@ void setConfigDefaults() {
   memset(config.schedule, MODE_OFF, SCHEDULE_SLOTS);
   config.max_charge_w    = 2500;
   config.max_discharge_w = 2500;
-  config.sc_min_soc      = 10;
-  config.sc_max_soc      = 95;
+  config.sc_min_soc      = 12;   // matches BMS discharge_cutoff (44001 = 120 ÷10)
+  config.sc_max_soc      = 100;  // matches BMS charge_cutoff    (44000 = 1000 ÷10)
   config.sc_offset_w     = 50.0f;
-  config.sc_smoothing    = 0.3f;
+  config.sc_smoothing    = 0.05f; // τ ≈ 20 s — must be slower than battery's physical ramp
   config.sc_deadband_w   = 100.0f;
   strncpy(config.meter_ip, "192.168.2.56:8088", sizeof(config.meter_ip) - 1);
   config.meter_ip[sizeof(config.meter_ip) - 1] = '\0';
-  config.fast_cycle_ms = 2000;
+  config.fast_cycle_ms = 1000;  // 1 Hz — required for force_mode/power heartbeat
 }
 
 void loadConfig() {
@@ -511,18 +579,25 @@ void loadConfig() {
   }
   config.max_charge_w    = prefs.getUShort("max_charge",   config.max_charge_w);
   config.max_discharge_w = prefs.getUShort("max_discharge", config.max_discharge_w);
-  config.sc_min_soc      = prefs.getUChar ("sc_min_soc",   config.sc_min_soc);
-  config.sc_max_soc      = prefs.getUChar ("sc_max_soc",   config.sc_max_soc);
   config.sc_offset_w     = prefs.getFloat ("sc_offset",    config.sc_offset_w);
-  config.sc_smoothing    = prefs.getFloat ("sc_smooth",    config.sc_smoothing);
   config.sc_deadband_w   = prefs.getFloat ("sc_deadband",  config.sc_deadband_w);
+  // Force ESP-side self-consumption guards AFTER reading NVS so stale NVS
+  // values can't override them. SoC guards match BMS cutoffs (44001 = 12 %
+  // floor, 44000 = 100 % ceiling). Smoothing tuned for bursty loads.
+  config.sc_min_soc    = 12;
+  config.sc_max_soc    = 100;
+  config.sc_smoothing  = 0.05f;  // τ ≈ 20 s — heavy grid-reading damping so the
+                                 // integrator doesn't react to transients caused
+                                 // by the battery's own response
+  config.sc_deadband_w = 100.0f;
   String ip = prefs.getString("meter_ip", "");
   if (ip.length() > 0 && ip.length() < sizeof(config.meter_ip)) {
     strncpy(config.meter_ip, ip.c_str(), sizeof(config.meter_ip) - 1);
     config.meter_ip[sizeof(config.meter_ip) - 1] = '\0';
   }
-  config.fast_cycle_ms = prefs.getULong("fast_cycle", config.fast_cycle_ms);
-  if (config.fast_cycle_ms < 1000) config.fast_cycle_ms = 1000;
+  // Force 1 Hz regardless of NVS — required for the Marstek force_mode /
+  // charge_power write heartbeat (Marstek stops acting ~60s after last write).
+  config.fast_cycle_ms = 1000;
   prefs.end();
 }
 
@@ -690,7 +765,11 @@ void runStateMachine() {
     if (!txnComplete) break;
     if (txnResultCode == Modbus::EX_SUCCESS) { memcpy(staged_fast.ac, regBuf, 4 * sizeof(uint16_t)); recordSuccess(); }
     else                                     { recordError(txnResultCode); }
-    pollState = isSlowCycle ? STATE_SEND_TEMPS : STATE_PROCESS_WRITES;
+    // Slow cycle now skips temps (32106-32110) and control-register reads
+    // — Marstek pauses charging when any of those regions are accessed.
+    // Goes straight to totals (33000-33003) which we're testing as the only
+    // remaining slow-cycle read.
+    pollState = isSlowCycle ? STATE_SEND_TOTALS : STATE_PROCESS_WRITES;
     break;
 
   // ===== Slow cycle: temps =====
@@ -703,7 +782,12 @@ void runStateMachine() {
     if (!txnComplete) break;
     if (txnResultCode == Modbus::EX_SUCCESS) { memcpy(staged_slow.temps, regBuf, REG_TEMPS_COUNT * sizeof(int16_t)); recordSuccess(); }
     else                                     { recordError(txnResultCode); }
-    pollState = STATE_SEND_CTRL_RS485;
+    // Skip control-register reads (42000/42010/42020/43000/44002 range): Marstek
+    // pauses charging for ~50s when any of those addresses is read. Reads of
+    // 32xxx (battery/AC/temps) and 33xxx (totals) are safe. Since force_mode /
+    // charge_power / discharge_power are now written unconditionally at 1 Hz,
+    // we don't need the drift-check reads anyway.
+    pollState = STATE_SEND_TOTALS;
     break;
 
   // ===== Slow cycle: control register drift check =====
@@ -798,7 +882,9 @@ void runStateMachine() {
     if (!cycle_enforce_done) {
       cache_batt_voltage = staged_fast.batt[0];
       cache_batt_current = (int16_t)staged_fast.batt[1];
-      cache_batt_power   = (int16_t)staged_fast.batt[2];
+      // REG_BATT_POWER (32102) is int32 spanning 32102-32103, scale 1 W.
+      // Big-endian: high word = staged_fast.batt[2], low word = batt[3].
+      cache_batt_power   = (int32_t)(((uint32_t)staged_fast.batt[2] << 16) | (uint32_t)staged_fast.batt[3]);
       cache_batt_soc     = staged_fast.batt[4];
       cache_batt_temp1   = (int16_t)staged_fast.batt[5];
 
@@ -808,15 +894,10 @@ void runStateMachine() {
       cache_ac_freq      = staged_fast.ac[3];
 
       if (isSlowCycle) {
+        // Only commit temps + totals. Control-register cache fields stay at
+        // the values we wrote (updated in STATE_WAIT_WRITE); reading them
+        // back from Marstek is what was causing the ~50s charging pause.
         memcpy(cache_temps, staged_slow.temps, sizeof(cache_temps));
-        cache_rs485_enable    = staged_slow.rs485_enable;
-        cache_force_mode      = staged_slow.force_mode;
-        cache_target_soc      = staged_slow.target_soc;
-        cache_charge_power    = staged_slow.charge_power;
-        cache_discharge_power = staged_slow.discharge_power;
-        cache_work_mode       = staged_slow.work_mode;
-        cache_max_charge      = staged_slow.max_charge;
-        cache_max_discharge   = staged_slow.max_discharge;
         cache_total_charge_energy    = ((uint32_t)staged_slow.totals[0] << 16) | staged_slow.totals[1];
         cache_total_discharge_energy = ((uint32_t)staged_slow.totals[2] << 16) | staged_slow.totals[3];
       }
@@ -859,6 +940,8 @@ void runStateMachine() {
         case REG_WORK_MODE:       cache_work_mode       = currentWrite.value; break;
         case REG_MAX_CHARGE:      cache_max_charge      = currentWrite.value; break;
         case REG_MAX_DISCHARGE:   cache_max_discharge   = currentWrite.value; break;
+        case REG_CHARGE_CUTOFF:   cache_charge_cutoff   = currentWrite.value; break;
+        case REG_DISCHARGE_CUTOFF: cache_discharge_cutoff = currentWrite.value; break;
       }
     } else {
       Serial.printf("[WRITE] reg %u = %u FAILED (0x%02X)\n", currentWrite.addr, currentWrite.value, txnResultCode);
@@ -973,20 +1056,30 @@ void setupRoutes() {
     m["current"]   = modeToString(current_mode);
     m["scheduled"] = modeToString(scheduledMode());
 
-    // Battery
+    // Battery. Marstek E3 silences REG_BATT_POWER while in force_mode and the
+    // current register's scale doesn't match physical reality (V×I comes out
+    // ~5× inflated). Best available signal is what we're commanding the
+    // battery to do — accurate in magnitude, a few seconds of command-lag.
+    // Sign: + = charging, − = discharging.
+    float batt_v = cache_batt_voltage / 100.0f;
+    float batt_i = cache_batt_current / 100.0f;  // scale unverified on Venus E3
+    float batt_p_cmd = (float)last_desired_cpow - (float)last_desired_dpow;
     JsonObject batt = doc.createNestedObject("battery");
-    batt["voltage"] = cache_batt_voltage / 100.0;
-    batt["current"] = cache_batt_current / 100.0;
-    batt["power"]   = cache_batt_power;
-    batt["soc"]     = cache_batt_soc;
-    batt["temp1"]   = cache_batt_temp1 / 10.0;
+    batt["voltage"]     = batt_v;
+    batt["current"]     = batt_i;
+    batt["power"]       = batt_p_cmd;          // signed; from last command (reliable)
+    batt["power_reg"]   = cache_batt_power;    // int32 register (silent in force_mode)
+    batt["power_vi"]    = batt_v * batt_i;     // V×I (current scale is wrong)
+    batt["soc"]         = cache_batt_soc;
+    batt["temp1"]       = cache_batt_temp1 / 10.0;
 
-    // AC
+    // AC — same proxy. REG_AC_POWER also unreliable under force_mode.
     JsonObject ac = doc.createNestedObject("ac");
-    ac["voltage"]   = cache_ac_voltage / 10.0;
-    ac["current"]   = cache_ac_current / 100.0;
-    ac["power"]     = cache_ac_power;
-    ac["frequency"] = cache_ac_freq / 100.0;
+    ac["voltage"]     = cache_ac_voltage / 10.0;
+    ac["current"]     = cache_ac_current / 100.0;
+    ac["power"]       = batt_p_cmd;
+    ac["power_raw"]   = cache_ac_power;
+    ac["frequency"]   = cache_ac_freq / 100.0;
 
     // Temperatures
     JsonArray temps = doc.createNestedArray("temperatures");
@@ -1121,14 +1214,32 @@ void setupRoutes() {
   });
 
   // POST /schedule — accepts either:
-  //   {"schedule": ["off", "max_charge", ...]}  (full 96-slot array)
+  //   {"schedule": ["off", "max_charge", ...]}  (full 96-slot array, ~1.8 KB)
   //   {"range": {"start": 0, "end": 96, "mode": "off"}}
   //   {"slot": 12, "mode": "max_charge"}
-  server.on("/schedule", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-      StaticJsonDocument<3072> doc;
-      DeserializationError err = deserializeJson(doc, data, len);
-      if (err) { request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}"); return; }
+  //
+  // Body arrives in TCP-sized chunks (~1460 B), so the full 96-slot variant
+  // can't be parsed per-chunk. We accumulate chunks into request->_tempObject
+  // in the body handler, then parse once in the main request handler after
+  // the full body is in. _tempObject is auto-freed when the request ends.
+  server.on("/schedule", HTTP_POST,
+    // Main handler — runs after the body is fully received.
+    [](AsyncWebServerRequest *request) {
+      uint8_t* body = (uint8_t*)request->_tempObject;
+      size_t total = request->contentLength();
+      if (!body || total == 0) {
+        request->send(400, "application/json", "{\"error\":\"Empty body\"}");
+        return;
+      }
+
+      StaticJsonDocument<4096> doc;
+      DeserializationError err = deserializeJson(doc, body, total);
+      if (err) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "{\"error\":\"Invalid JSON: %s\"}", err.c_str());
+        request->send(400, "application/json", msg);
+        return;
+      }
       JsonObject root = doc.as<JsonObject>();
 
       if (root.containsKey("schedule")) {
@@ -1185,6 +1296,17 @@ void setupRoutes() {
       buildScheduleJson(resp);
       String json; serializeJson(resp, json);
       request->send(200, "application/json", json);
+    },
+    NULL,  // no upload handler
+    // Body handler — called once per chunk. Accumulate into _tempObject.
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (index == 0) {
+        if (total == 0 || total > 8192) return;  // reject empty or oversized
+        request->_tempObject = malloc(total);
+      }
+      if (request->_tempObject && index + len <= total) {
+        memcpy((uint8_t*)request->_tempObject + index, data, len);
+      }
     }
   );
 }
