@@ -251,6 +251,24 @@ void recordError(uint8_t code) {
   }
 }
 
+// --- Watchdog: detect when Marstek wedges (commanded but not moving energy) ---
+// Marstek occasionally stops acting on force_mode commands. Power-cycling the
+// LilyGO unwedges it — hypothesis is that the startup write sequence (RS485
+// enable → workmode → max_charge → max_discharge) is what re-primes the
+// inverter. So the watchdog: when we're commanding charge/discharge, watch
+// the lifetime energy counter for the active direction. If it doesn't tick
+// for WATCHDOG_WINDOW_MS, jump back to STATE_STARTUP_RS485 to replay that
+// sequence. After firing, hold off for WATCHDOG_COOLDOWN_MS so a still-
+// wedged Marstek doesn't trigger restart-loops.
+const unsigned long WATCHDOG_WINDOW_MS   = 30UL * 60UL * 1000UL;
+const unsigned long WATCHDOG_COOLDOWN_MS = 30UL * 60UL * 1000UL;
+static unsigned long watchdog_window_start_ms   = 0;
+static uint32_t      watchdog_baseline_charge   = 0;
+static uint32_t      watchdog_baseline_discharge = 0;
+static uint8_t       watchdog_armed_dir         = 0;  // 0 = idle, 1 = charge, 2 = discharge
+static unsigned long watchdog_last_trigger_ms   = 0;
+static uint16_t      watchdog_trigger_count     = 0;
+
 // --- Write queue ---
 #define WRITE_QUEUE_SIZE 16
 static WriteEntry writeQueue[WRITE_QUEUE_SIZE];
@@ -631,6 +649,69 @@ static uint8_t       startupRetries = 0;
 
 static WriteEntry currentWrite;
 
+// Watchdog — see globals near recordError() for design notes.
+void checkWatchdog() {
+  unsigned long now = millis();
+
+  // Cooldown after a trigger: give the replayed startup writes time to land
+  // and energy to start flowing before we'd consider firing again.
+  if (watchdog_last_trigger_ms != 0 &&
+      now - watchdog_last_trigger_ms < WATCHDOG_COOLDOWN_MS) {
+    return;
+  }
+
+  uint16_t fmode = last_desired_fmode;
+  bool charging    = (fmode == 1 && last_desired_cpow > 0);
+  bool discharging = (fmode == 2 && last_desired_dpow > 0);
+
+  // SoC guards — at the BMS cutoffs the battery legitimately stops moving
+  // energy even with a valid command. Floor of 12 % matches REG_DISCHARGE_CUTOFF.
+  if (charging    && cache_batt_soc >= 100) charging    = false;
+  if (discharging && cache_batt_soc <= 12)  discharging = false;
+
+  if (!charging && !discharging) {
+    watchdog_armed_dir = 0;
+    return;
+  }
+
+  uint8_t  dir          = charging ? 1 : 2;
+  uint32_t energy_now   = charging ? cache_total_charge_energy
+                                   : cache_total_discharge_energy;
+  uint32_t baseline_now = charging ? watchdog_baseline_charge
+                                   : watchdog_baseline_discharge;
+
+  // First entry into an active command, or direction flip → arm window.
+  if (watchdog_armed_dir != dir) {
+    watchdog_armed_dir          = dir;
+    watchdog_window_start_ms    = now;
+    watchdog_baseline_charge    = cache_total_charge_energy;
+    watchdog_baseline_discharge = cache_total_discharge_energy;
+    return;
+  }
+
+  // Energy moved → battery is responding, slide the window forward.
+  if (energy_now > baseline_now) {
+    watchdog_window_start_ms    = now;
+    watchdog_baseline_charge    = cache_total_charge_energy;
+    watchdog_baseline_discharge = cache_total_discharge_energy;
+    return;
+  }
+
+  // Stuck for the full window → replay the startup write sequence.
+  if (now - watchdog_window_start_ms >= WATCHDOG_WINDOW_MS) {
+    Serial.printf("[WATCHDOG] No %s energy for %lums (cmd fmode=%u cpow=%u dpow=%u soc=%u) -- re-running startup\n",
+                  charging ? "charge" : "discharge",
+                  now - watchdog_window_start_ms,
+                  last_desired_fmode, last_desired_cpow, last_desired_dpow,
+                  cache_batt_soc);
+    watchdog_last_trigger_ms = now;
+    watchdog_trigger_count++;
+    watchdog_armed_dir       = 0;
+    startupRetries           = 0;
+    pollState                = STATE_STARTUP_RS485;
+  }
+}
+
 bool trySendReadHreg(uint16_t addr, uint16_t count, PollState nextState) {
   txnComplete = false;
   if (mb.readHreg(SLAVE_ID, addr, regBuf, count, modbusCallback)) {
@@ -903,7 +984,11 @@ void runStateMachine() {
       }
 
       enforceDesiredState();
+      checkWatchdog();
       cycle_enforce_done = true;
+      // Watchdog may have hijacked pollState to replay startup — bail before
+      // the queue-drain code below would clobber it.
+      if (pollState != STATE_PROCESS_WRITES) break;
     }
 
     // Drain queue
@@ -1030,6 +1115,16 @@ void setupRoutes() {
     int8_t slot = currentSlotIndex();
     doc["slot"]                = slot;
     doc["mode"]                = modeToString(current_mode);
+
+    JsonObject wd = doc.createNestedObject("watchdog");
+    wd["armed_dir"]      = watchdog_armed_dir;  // 0=idle, 1=charge, 2=discharge
+    wd["window_age_ms"]  = watchdog_armed_dir
+                            ? (long)(millis() - watchdog_window_start_ms) : 0;
+    wd["window_max_ms"]  = (long)WATCHDOG_WINDOW_MS;
+    wd["trigger_count"]  = watchdog_trigger_count;
+    wd["last_trigger_ms_ago"] = watchdog_last_trigger_ms
+                            ? (long)(millis() - watchdog_last_trigger_ms) : -1;
+
     String json; serializeJson(doc, json);
     request->send(200, "application/json", json);
   });
